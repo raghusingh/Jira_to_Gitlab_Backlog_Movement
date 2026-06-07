@@ -29,9 +29,8 @@ public class SyncOrchestrator : ISyncOrchestrator
         _log.LogInformation("=== Sync run started at {Time} UTC ===", DateTime.UtcNow);
         var result = new SyncResult();
 
-        // ── 1. Check if a current sprint milestone exists in GitLab ───────────
+        // ── 1. Resolve target GitLab milestone ────────────────────────────────
         //
-        // Rule:
         //   Active milestone exists today  →  ALL tickets go into that milestone
         //   No active milestone            →  ALL tickets go into Backlog
         //
@@ -53,27 +52,32 @@ public class SyncOrchestrator : ISyncOrchestrator
                 DateTime.UtcNow.ToString("yyyy-MM-dd"));
         }
 
-        // ── 2. Fetch all Jira tickets ─────────────────────────────────────────
-        var sprintTickets = await _jira.GetActiveSprintTicketsAsync(ct);
-        var backlogTickets = await _jira.GetBacklogTicketsAsync(ct);
-        var allTickets = sprintTickets.Concat(backlogTickets).ToList();
+        // ── 2. Fetch ALL Jira tickets in one single query ─────────────────────
+        //
+        // FIX: replaced GetActiveSprintTicketsAsync + GetBacklogTicketsAsync
+        //      (both returned 0) with GetAllTicketsAsync which uses a single
+        //      clean JQL with no sprint filter and deduplicated issue types.
+        //
+        var allTickets = await _jira.GetAllTicketsAsync(ct);
 
         _log.LogInformation(
-            "Jira returned {Sprint} sprint ticket(s) and {Backlog} backlog ticket(s). " +
-            "Total to sync: {Total}.",
-            sprintTickets.Count, backlogTickets.Count, allTickets.Count);
+            "Jira returned {Total} ticket(s) total to sync.",
+            allTickets.Count);
+
+        if (allTickets.Count == 0)
+        {
+            _log.LogWarning("No tickets returned from Jira. Nothing to sync.");
+            _log.LogInformation("=== Sync run complete — nothing to do ===");
+            return result;
+        }
 
         // ── 3. Resolve the single target milestone for this sync run ──────────
-        //
-        // If an active GitLab milestone exists → use it for every ticket.
-        // Otherwise → create/find the Backlog milestone and use that.
-        //
         GitLabMilestone targetMilestone = activeMilestone
             ?? await _gitLab.GetOrCreateBacklogMilestoneAsync(ct);
 
         _log.LogInformation(
-            "Target milestone for this run: '{Title}' (id={Id})",
-            targetMilestone.Title, targetMilestone.Id);
+            "Target milestone: '{Title}' (id={Id}). Syncing {Count} ticket(s).",
+            targetMilestone.Title, targetMilestone.Id, allTickets.Count);
 
         // ── 4. Sync every ticket into the target milestone ────────────────────
         foreach (var ticket in allTickets)
@@ -110,8 +114,6 @@ public class SyncOrchestrator : ISyncOrchestrator
             }
             else
             {
-                // Update the existing issue — this also moves it to the correct
-                // milestone if it was previously in Backlog and a sprint started.
                 await _gitLab.UpdateIssueAsync(existing.Iid, ticket, targetMilestone.Id, ct);
                 _log.LogInformation(
                     "Updated : [{JiraKey}] !{Iid} '{Summary}' → milestone '{Milestone}'",

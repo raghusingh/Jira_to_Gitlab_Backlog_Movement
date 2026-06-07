@@ -11,6 +11,10 @@ namespace JiraGitLabSync.Services;
 
 public interface IJiraService
 {
+    /// <summary>Fetch ALL project tickets in one query — no sprint filter.</summary>
+    Task<List<SyncTicket>> GetAllTicketsAsync(CancellationToken ct = default);
+
+    // Kept for interface compatibility — both return empty lists
     Task<List<SyncTicket>> GetActiveSprintTicketsAsync(CancellationToken ct = default);
     Task<List<SyncTicket>> GetBacklogTicketsAsync(CancellationToken ct = default);
 }
@@ -21,16 +25,12 @@ public class JiraService : IJiraService
     private readonly JiraSettings _settings;
     private readonly ILogger<JiraService> _log;
 
-    // Used ONLY for serializing request bodies:
-    //   - WhenWritingNull  => nextPageToken is omitted on first page
-    //   - CamelCase        => property names match Jira's expected JSON keys
     private static readonly JsonSerializerOptions _reqOpts = new()
     {
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    // Used ONLY for deserializing responses (case-insensitive)
     private static readonly JsonSerializerOptions _resOpts = new()
     {
         PropertyNameCaseInsensitive = true
@@ -54,6 +54,7 @@ public class JiraService : IJiraService
         _settings = settings.Value;
         _log = log;
 
+        // Basic Auth: base64(username:apitoken)
         var credentials = Convert.ToBase64String(
             Encoding.UTF8.GetBytes($"{_settings.Username}:{_settings.ApiToken}"));
 
@@ -61,6 +62,7 @@ public class JiraService : IJiraService
             new AuthenticationHeaderValue("Basic", credentials);
         _http.DefaultRequestHeaders.Accept.Add(
             new MediaTypeWithQualityHeaderValue("application/json"));
+
         _http.BaseAddress = new Uri(_settings.BaseUrl.TrimEnd('/') + "/");
     }
 
@@ -68,39 +70,42 @@ public class JiraService : IJiraService
     // Public
     // -------------------------------------------------------------------------
 
-    public async Task<List<SyncTicket>> GetActiveSprintTicketsAsync(CancellationToken ct = default)
+    /// <summary>
+    /// Single unified query — fetches ALL tickets regardless of sprint/backlog.
+    /// Fix 1: Uses .Distinct() to prevent duplicate issue types in JQL.
+    /// Fix 2: No sprint filter — works for tickets in sprint AND backlog.
+    /// Fix 3: No JQL templates from config — built directly here.
+    /// </summary>
+    public async Task<List<SyncTicket>> GetAllTicketsAsync(CancellationToken ct = default)
     {
-        var issueTypesCsv = string.Join(",", _settings.IssueTypes.Select(t => $"\"{t}\""));
-        var jql = string.Format(_settings.ActiveSprintJqlTemplate,
-            _settings.ProjectKey, issueTypesCsv);
+        // Fix 1: Deduplicate issue types to prevent:
+        // issuetype in ("Story","Bug","Task","Story","Bug","Task")
+        var distinctTypes = _settings.IssueTypes
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-        _log.LogInformation("Fetching active-sprint tickets. JQL: {Jql}", jql);
-        return (await FetchAllIssuesAsync(jql, ct)).Select(ToSyncTicket).ToList();
+        var issueTypesCsv = string.Join(",", distinctTypes.Select(t => $"\"{t}\""));
+
+        // Fix 2: No sprint filter — fetches sprint tickets AND backlog tickets
+        var jql = $"project = \"{_settings.ProjectKey}\" " +
+                  $"AND issuetype in ({issueTypesCsv}) " +
+                  $"ORDER BY created DESC";
+
+        _log.LogInformation("Fetching all tickets from Jira. JQL: {Jql}", jql);
+        var issues = await FetchAllIssuesAsync(jql, ct);
+        _log.LogInformation("Jira returned {Count} ticket(s) total.", issues.Count);
+        return issues.Select(ToSyncTicket).ToList();
     }
 
-    public async Task<List<SyncTicket>> GetBacklogTicketsAsync(CancellationToken ct = default)
-    {
-        var issueTypesCsv = string.Join(",", _settings.IssueTypes.Select(t => $"\"{t}\""));
-        var jql = string.Format(_settings.BacklogJqlTemplate,
-            _settings.ProjectKey, issueTypesCsv);
+    // Kept for interface compatibility — not called by SyncOrchestrator anymore
+    public Task<List<SyncTicket>> GetActiveSprintTicketsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<SyncTicket>());
 
-        _log.LogInformation("Fetching backlog tickets. JQL: {Jql}", jql);
-        return (await FetchAllIssuesAsync(jql, ct)).Select(ToSyncTicket).ToList();
-    }
+    public Task<List<SyncTicket>> GetBacklogTicketsAsync(CancellationToken ct = default)
+        => Task.FromResult(new List<SyncTicket>());
 
     // -------------------------------------------------------------------------
-    // POST /rest/api/3/search/jql
-    //
-    // Confirmed body schema (from Atlassian official docs):
-    //   jql            string    required
-    //   maxResults     int       optional  (NOT "limit" — that was wrong)
-    //   fields         string[]  optional
-    //   nextPageToken  string    optional  (cursor; omit entirely on first page)
-    //   expand         string    optional
-    //   properties     string[]  optional
-    //   fieldsByKeys   bool      optional
-    //
-    // Pagination: response contains nextPageToken (string) and isLast (bool)
+    // POST /rest/api/3/search/jql  (cursor-based pagination)
     // -------------------------------------------------------------------------
 
     private async Task<List<JiraIssue>> FetchAllIssuesAsync(string jql, CancellationToken ct)
@@ -115,11 +120,11 @@ public class JiraService : IJiraService
                 Jql = jql,
                 MaxResults = 50,
                 Fields = _searchFields,
-                NextPageToken = nextPageToken  // null on first call — omitted by WhenWritingNull
+                NextPageToken = nextPageToken
             };
 
             var bodyJson = JsonSerializer.Serialize(request, _reqOpts);
-            _log.LogDebug("Jira POST /rest/api/3/search/jql body: {Body}", bodyJson);
+            _log.LogDebug("Jira POST body: {Body}", bodyJson);
 
             var content = new StringContent(bodyJson, Encoding.UTF8, "application/json");
             var response = await _http.PostAsync("rest/api/3/search/jql", content, ct);
@@ -127,7 +132,7 @@ public class JiraService : IJiraService
             if (!response.IsSuccessStatusCode)
             {
                 var err = await response.Content.ReadAsStringAsync(ct);
-                _log.LogError("Jira {Status} {Reason} body: {Err}",
+                _log.LogError("Jira {Status} {Reason}: {Body}",
                     (int)response.StatusCode, response.ReasonPhrase, err);
                 response.EnsureSuccessStatusCode();
             }
@@ -138,7 +143,7 @@ public class JiraService : IJiraService
 
             all.AddRange(page.Issues);
             _log.LogDebug("Page: {Count} issues, isLast={IsLast}, nextToken={Token}",
-                page.Issues.Count, page.IsLast, page.NextPageToken ?? "—");
+                page.Issues.Count, page.IsLast, page.NextPageToken ?? "none");
 
             if (page.IsLast || page.Issues.Count == 0 || string.IsNullOrEmpty(page.NextPageToken))
                 break;
@@ -177,20 +182,17 @@ public class JiraService : IJiraService
 }
 
 // -------------------------------------------------------------------------
-// DTOs — property names match what Jira's API actually sends/receives
+// DTOs
 // -------------------------------------------------------------------------
 
-/// <summary>Request body for POST /rest/api/3/search/jql</summary>
 internal sealed class JiraSearchRequest
 {
-    // CamelCase policy maps these to: jql, maxResults, fields, nextPageToken
     public string Jql { get; set; } = string.Empty;
     public int MaxResults { get; set; } = 50;
     public string[] Fields { get; set; } = [];
-    public string? NextPageToken { get; set; }  // omitted when null
+    public string? NextPageToken { get; set; }
 }
 
-/// <summary>Response from POST /rest/api/3/search/jql</summary>
 internal sealed class JiraSearchPageResponse
 {
     [JsonPropertyName("issues")]
